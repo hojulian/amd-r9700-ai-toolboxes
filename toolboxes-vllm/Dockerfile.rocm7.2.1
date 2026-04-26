@@ -1,0 +1,172 @@
+FROM registry.fedoraproject.org/fedora:43
+
+# 1. System Base & Build Tools
+RUN dnf -y install --setopt=install_weak_deps=False --nodocs \
+  python3.12 python3.12-devel git rsync libatomic bash ca-certificates curl \
+  gcc gcc-c++ binutils make ffmpeg-free \
+  cmake ninja-build aria2 tar xz vim nano \
+  libdrm-devel zlib-devel openssl-devel jq \
+  numactl-devel gperftools-libs dialog procps-ng \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+# 2. Install ROCm 7.2.1 from official AMD repository
+RUN tee /etc/yum.repos.d/rocm.repo <<'REPO'
+[ROCm-7.2.1]
+name=ROCm7.2.1
+baseurl=https://repo.radeon.com/rocm/rhel10/7.2.1/main
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+REPO
+
+RUN dnf -y --nodocs --setopt=install_weak_deps=False \
+  --exclude='*sdk*' --exclude='*samples*' --exclude='*-doc*' --exclude='*-docs*' \
+  install \
+  rocm-llvm rocm-device-libs hip-runtime-amd hip-devel \
+  rocblas rocblas-devel hipblas hipblas-devel \
+  miopen-hip miopen-hip-devel \
+  rocfft rocfft-devel hipsolver hipsolver-devel \
+  rocm-cmake rocminfo radeontop \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+# 3. Configure Global ROCm Environment
+RUN BITCODE_PATH=$(find /opt/rocm -type d -name bitcode -print -quit 2>/dev/null || echo /opt/rocm/amdgcn/bitcode) && \
+  printf '%s\n' \
+  "export ROCM_PATH=/opt/rocm" \
+  "export HIP_PLATFORM=amd" \
+  "export HIP_PATH=/opt/rocm" \
+  "export HIP_CLANG_PATH=/opt/rocm/llvm/bin" \
+  "export HIP_DEVICE_LIB_PATH=$BITCODE_PATH" \
+  "export PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:\$PATH" \
+  "export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:\$LD_LIBRARY_PATH" \
+  "export ROCBLAS_USE_HIPBLASLT=1" \
+  "export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1" \
+  "export VLLM_TARGET_DEVICE=rocm" \
+  "export HIP_FORCE_DEV_KERNARG=1" \
+  "export RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1" \
+  "export LD_PRELOAD=/usr/lib64/libtcmalloc_minimal.so.4" \
+  > /etc/profile.d/rocm-sdk.sh && \
+  chmod 0644 /etc/profile.d/rocm-sdk.sh
+
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PLATFORM=amd
+ENV HIP_PATH=/opt/rocm
+ENV HIP_CLANG_PATH=/opt/rocm/llvm/bin
+ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:$LD_LIBRARY_PATH
+
+# 4. Python Venv Setup
+RUN /usr/bin/python3.12 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+ENV PIP_NO_CACHE_DIR=1
+RUN printf 'source /opt/venv/bin/activate\n' > /etc/profile.d/venv.sh
+RUN python -m pip install --upgrade pip wheel packaging "setuptools<80.0.0"
+
+# 5. Install PyTorch with ROCm 7.2 support
+# Uses AMD pre-release wheels that include gfx1201 support
+RUN python -m pip install \
+  --index-url https://download.pytorch.org/whl/rocm7.2 \
+  --pre torch torchaudio torchvision && \
+  find /opt/venv/lib/python3.12/site-packages/torch* -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true && \
+  find /opt/venv/lib/python3.12/site-packages/torch* -type d -name "__pycache__" -prune -exec rm -rf {} +
+
+# 6. Flash-Attention
+WORKDIR /opt
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+RUN git clone https://github.com/ROCm/flash-attention.git && \
+  cd flash-attention && \
+  git checkout main_perf && \
+  python setup.py install && \
+  cd /opt && rm -rf /opt/flash-attention
+
+# 7. Clone vLLM
+RUN git clone https://github.com/vllm-project/vllm.git /opt/vllm
+WORKDIR /opt/vllm
+
+# Patch vLLM for gfx1201: force ROCm detection without amdsmi, fix transformers imports
+RUN echo "import sys, re" > patch_vllm.py && \
+  echo "from pathlib import Path" >> patch_vllm.py && \
+  echo "p = Path('vllm/platforms/__init__.py')" >> patch_vllm.py && \
+  echo "txt = p.read_text()" >> patch_vllm.py && \
+  echo "txt = txt.replace('import amdsmi', '# import amdsmi')" >> patch_vllm.py && \
+  echo "txt = re.sub(r'is_rocm = .*', 'is_rocm = True', txt)" >> patch_vllm.py && \
+  echo "txt = re.sub(r'if len\(amdsmi\.amdsmi_get_processor_handles\(\)\) > 0:', 'if True:', txt)" >> patch_vllm.py && \
+  echo "txt = txt.replace('amdsmi.amdsmi_init()', 'pass')" >> patch_vllm.py && \
+  echo "txt = txt.replace('amdsmi.amdsmi_shut_down()', 'pass')" >> patch_vllm.py && \
+  echo "p.write_text(txt)" >> patch_vllm.py && \
+  echo "p = Path('vllm/platforms/rocm.py')" >> patch_vllm.py && \
+  echo "txt = p.read_text()" >> patch_vllm.py && \
+  echo "header = 'import sys\nfrom unittest.mock import MagicMock\nsys.modules[\"amdsmi\"] = MagicMock()\n'" >> patch_vllm.py && \
+  echo "txt = header + txt" >> patch_vllm.py && \
+  echo "txt = re.sub(r'device_type = .*', 'device_type = \"rocm\"', txt)" >> patch_vllm.py && \
+  echo "txt = re.sub(r'device_name = .*', 'device_name = \"gfx1201\"', txt)" >> patch_vllm.py && \
+  echo "txt += '\n    def get_device_name(self, device_id: int = 0) -> str:\n        return \"AMD-gfx1201\"\n'" >> patch_vllm.py && \
+  echo "p.write_text(txt)" >> patch_vllm.py && \
+  echo "p = Path('vllm/transformers_utils/config.py')" >> patch_vllm.py && \
+  echo "txt = p.read_text()" >> patch_vllm.py && \
+  echo "txt = txt.replace('from transformers import GenerationConfig, PretrainedConfig', 'from transformers.generation import GenerationConfig\nfrom transformers.configuration_utils import PretrainedConfig')" >> patch_vllm.py && \
+  echo "txt = txt.replace('from transformers import PretrainedConfig, GenerationConfig', 'from transformers.generation import GenerationConfig\nfrom transformers.configuration_utils import PretrainedConfig')" >> patch_vllm.py && \
+  echo "txt = txt.replace('from transformers import PretrainedConfig', 'from transformers.configuration_utils import PretrainedConfig')" >> patch_vllm.py && \
+  echo "txt = txt.replace('from transformers import GenerationConfig', 'from transformers.generation import GenerationConfig')" >> patch_vllm.py && \
+  echo "p.write_text(txt)" >> patch_vllm.py && \
+  echo "p = Path('vllm/platforms/rocm.py')" >> patch_vllm.py && \
+  echo "txt = p.read_text()" >> patch_vllm.py && \
+  echo "txt = re.sub(r'_GCN_ARCH\s*=\s*_get_gcn_arch\(\)', '_GCN_ARCH = \"gfx1201\"', txt)" >> patch_vllm.py && \
+  echo "p.write_text(txt)" >> patch_vllm.py && \
+  echo "print('Successfully patched vLLM for R9700')" >> patch_vllm.py && \
+  python patch_vllm.py
+
+# 8. Build vLLM with ROCm Clang host compiler to match PyTorch ABI
+RUN python -m pip install --upgrade cmake ninja packaging wheel numpy "setuptools-scm>=8" "setuptools<80.0.0" scikit-build-core pybind11
+ENV ROCM_HOME="/opt/rocm"
+ENV VLLM_TARGET_DEVICE="rocm"
+ENV PYTORCH_ROCM_ARCH="gfx1201"
+ENV HIP_ARCHITECTURES="gfx1201"
+ENV AMDGPU_TARGETS="gfx1201"
+ENV MAX_JOBS="4"
+ENV CC="/opt/rocm/llvm/bin/clang"
+ENV CXX="/opt/rocm/llvm/bin/clang++"
+
+RUN export HIP_DEVICE_LIB_PATH=$(find /opt/rocm -type d -name bitcode -print -quit 2>/dev/null || echo /opt/rocm/amdgcn/bitcode) && \
+  echo "Compiling with Bitcode: $HIP_DEVICE_LIB_PATH" && \
+  export CMAKE_ARGS="-DROCM_PATH=/opt/rocm -DHIP_PATH=/opt/rocm -DAMDGPU_TARGETS=gfx1201 -DHIP_ARCHITECTURES=gfx1201" && \
+  python -m pip wheel --no-build-isolation --no-deps -w /tmp/dist -v . && \
+  python -m pip install /tmp/dist/*.whl && \
+  rm -rf /tmp/dist && \
+  find /opt/venv/lib/python3.12/site-packages/vllm -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true && \
+  find /opt/venv/lib/python3.12/site-packages/vllm -type d -name "__pycache__" -prune -exec rm -rf {} +
+
+# 9. bitsandbytes (ROCm)
+WORKDIR /opt
+RUN git clone -b rocm_enabled_multi_backend https://github.com/ROCm/bitsandbytes.git
+WORKDIR /opt/bitsandbytes
+ENV HIP_PLATFORM="amd"
+ENV CMAKE_PREFIX_PATH="/opt/rocm"
+RUN cmake -S . \
+  -DGPU_TARGETS="gfx1201" \
+  -DBNB_ROCM_ARCH="gfx1201" \
+  -DCOMPUTE_BACKEND=hip \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+  && \
+  make -j$(nproc) && \
+  python -m pip install --no-cache-dir . --no-build-isolation --no-deps && \
+  find /opt/venv/lib/python3.12/site-packages/bitsandbytes -type d -name "__pycache__" -prune -exec rm -rf {} +
+
+# 10. Runtime Configuration
+WORKDIR /opt
+COPY scripts/01-rocm-envs.sh /etc/profile.d/01-rocm-envs.sh
+COPY scripts/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
+COPY scripts/zz-venv-last.sh /etc/profile.d/zz-venv-last.sh
+COPY scripts/start_vllm.py /usr/local/bin/start-vllm
+COPY benchmarks/max_context_results.json /opt/max_context_results.json
+COPY benchmarks/run_vllm_bench.py /opt/run_vllm_bench.py
+RUN chmod 0644 /etc/profile.d/*.sh && \
+  chmod +x /usr/local/bin/start-vllm && \
+  chmod 0644 /opt/max_context_results.json
+RUN printf 'ulimit -S -c 0\n' > /etc/profile.d/90-nocoredump.sh && \
+  chmod 0644 /etc/profile.d/90-nocoredump.sh
+
+CMD ["/bin/bash"]
