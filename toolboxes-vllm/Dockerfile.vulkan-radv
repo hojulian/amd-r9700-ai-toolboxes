@@ -1,12 +1,14 @@
 FROM registry.fedoraproject.org/fedora:43
 
 # 1. System Base & Build Tools
+# Mesa RADV (open-source Vulkan driver) + ROCm 7.2.1 for compute
 RUN dnf -y install --setopt=install_weak_deps=False --nodocs \
   python3.12 python3.12-devel git rsync libatomic bash ca-certificates curl \
   gcc gcc-c++ binutils make ffmpeg-free \
-  cmake ninja-build aria2 tar xz vim nano \
+  cmake ninja-build tar xz vim nano \
   libdrm-devel zlib-devel openssl-devel jq \
   numactl-devel gperftools-libs dialog procps-ng \
+  vulkan-loader vulkan-loader-devel mesa-vulkan-drivers radeontop \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
 # 2. Install ROCm 7.2.1 from official AMD repository
@@ -27,10 +29,10 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False \
   rocblas rocblas-devel hipblas hipblas-devel \
   miopen-hip miopen-hip-devel \
   rocfft rocfft-devel hipsolver hipsolver-devel \
-  rocm-cmake rocminfo radeontop \
+  rocm-cmake rocminfo \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
-# 3. Configure Global ROCm Environment
+# 3. Configure Global ROCm + RADV Environment
 RUN BITCODE_PATH=$(find /opt/rocm -type d -name bitcode -print -quit 2>/dev/null || echo /opt/rocm/amdgcn/bitcode) && \
   printf '%s\n' \
   "export ROCM_PATH=/opt/rocm" \
@@ -46,6 +48,7 @@ RUN BITCODE_PATH=$(find /opt/rocm -type d -name bitcode -print -quit 2>/dev/null
   "export HIP_FORCE_DEV_KERNARG=1" \
   "export RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1" \
   "export LD_PRELOAD=/usr/lib64/libtcmalloc_minimal.so.4" \
+  "export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json" \
   > /etc/profile.d/rocm-sdk.sh && \
   chmod 0644 /etc/profile.d/rocm-sdk.sh
 
@@ -55,6 +58,7 @@ ENV HIP_PATH=/opt/rocm
 ENV HIP_CLANG_PATH=/opt/rocm/llvm/bin
 ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:$LD_LIBRARY_PATH
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 
 # 4. Python Venv Setup
 RUN /usr/bin/python3.12 -m venv /opt/venv

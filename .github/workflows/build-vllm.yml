@@ -5,7 +5,7 @@ on:
     inputs:
       backends:
         description: >
-          Comma-separated backends to build (e.g. "nightlies,rocm7.2.1").
+          Comma-separated backends to build (e.g. "nightlies,vulkan-radv").
           Use "all" to build everything.
         required: false
         default: all
@@ -27,7 +27,7 @@ jobs:
           IN='${{ inputs.backends }}'
 
           if [[ "$IN" == "all" || -z "$IN" ]]; then
-            JSON='["nightlies","rocm7.2.1"]'
+            JSON='["nightlies","vulkan-radv"]'
           else
             IN_CLEAN=$(echo "$IN" | tr -d '[:space:]')
             JSON='["'${IN_CLEAN//,/\",\"}'"]'
